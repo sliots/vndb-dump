@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Mirror VNDB's four documented public dumps into complete, immutable releases."""
+import base64
 import datetime as dt
 import email.utils
 import gzip
@@ -107,7 +108,13 @@ def get_release(tag):
                             capture_output=True, text=True)
     if result.returncode:
         if '(HTTP 404)' in result.stderr:
-            return None
+            # The tag endpoint excludes unpublished drafts, even for their
+            # creator. The authenticated list endpoint includes drafts.
+            pages = json.loads(run('gh', 'api', '--paginate', '--slurp',
+                                   f'repos/{os.environ["GH_REPO"]}/releases?per_page=100',
+                                   capture=True))
+            return next((release for page in pages for release in page
+                         if release['tag_name'] == tag), None)
         raise RuntimeError(result.stderr)
     return json.loads(result.stdout)
 
@@ -145,6 +152,30 @@ def publish(tag, directory, paths, notes):
     run('gh', 'release', 'edit', tag, '--notes-file', str(notes_path),
         '--draft=false', '--latest')
     return 'Published: ' + get_release(tag)['html_url']
+
+
+def keep_schedule_active():
+    # Public scheduled workflows can be disabled after 60 days of inactivity.
+    # One tiny monthly commit keeps this unattended mirror active. This path
+    # is excluded from the workflow's push filters and never triggers a loop.
+    if os.environ.get('GITHUB_REF') != 'refs/heads/main':
+        return
+    month = dt.datetime.now(dt.timezone.utc).strftime('%Y-%m') + '\n'
+    endpoint = f'repos/{os.environ["GH_REPO"]}/contents/.github/sync-heartbeat'
+    response = subprocess.run(['gh', 'api', endpoint + '?ref=main'], capture_output=True, text=True)
+    current = None
+    if response.returncode == 0:
+        current = json.loads(response.stdout)
+        if base64.b64decode(current['content']).decode() == month:
+            return
+    elif '(HTTP 404)' not in response.stderr:
+        raise RuntimeError(response.stderr)
+    payload = {'message': 'chore: monthly synchronization heartbeat', 'branch': 'main',
+               'content': base64.b64encode(month.encode()).decode()}
+    if current:
+        payload['sha'] = current['sha']
+    subprocess.run(['gh', 'api', '--method', 'PUT', endpoint, '--input', '-', '--silent'],
+                   input=json.dumps(payload), text=True, check=True)
 
 
 def main():
@@ -198,6 +229,7 @@ def main():
                      f'Bundle SHA-256: `{digest}`\n')
             result = publish(tag, directory, paths, notes)
         print(result)
+        keep_schedule_active()
         if os.environ.get('GITHUB_STEP_SUMMARY'):
             with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
                 summary.write(result + '\n')

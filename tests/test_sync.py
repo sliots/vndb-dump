@@ -1,3 +1,4 @@
+import base64
 import gzip
 import importlib.util
 import json
@@ -48,7 +49,16 @@ class SyncTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 sync.get_release('tag')
             run.return_value = subprocess.CompletedProcess([], 1, '', 'Not Found (HTTP 404)')
-            self.assertIsNone(sync.get_release('tag'))
+            with patch.object(sync, 'run', return_value='[[]]'):
+                self.assertIsNone(sync.get_release('tag'))
+
+    def test_tag_404_falls_back_to_paginated_drafts(self):
+        draft = {'id': 123, 'tag_name': 'tag', 'draft': True, 'assets': []}
+        with patch.dict(os.environ, GH_REPO='owner/repo'), patch.object(sync.subprocess, 'run') as request, patch.object(sync, 'run') as cli:
+            request.return_value = subprocess.CompletedProcess([], 1, '', 'Not Found (HTTP 404)')
+            cli.return_value = json.dumps([[{'tag_name': 'different'}], [draft]])
+            self.assertEqual(sync.get_release('tag'), draft)
+            self.assertIn('--paginate', cli.call_args.args)
 
     def test_uploaded_size_digest_and_set_are_checked(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -85,6 +95,20 @@ class SyncTests(unittest.TestCase):
                 sync.publish('tag', directory, [path], 'notes')
                 self.assertEqual(run.call_args_list[0].args[:3], ('gh', 'release', 'upload'))
                 self.assertEqual(run.call_args_list[-1].args[:3], ('gh', 'release', 'edit'))
+
+    def test_heartbeat_writes_at_most_once_per_month(self):
+        current_month = sync.dt.datetime.now(sync.dt.timezone.utc).strftime('%Y-%m') + '\n'
+        with patch.dict(os.environ, GH_REPO='owner/repo', GITHUB_REF='refs/heads/main'), patch.object(sync.subprocess, 'run') as run:
+            run.return_value = subprocess.CompletedProcess([], 0, json.dumps({'sha': 'abc', 'content': base64.b64encode(current_month.encode()).decode()}), '')
+            sync.keep_schedule_active()
+            self.assertEqual(run.call_count, 1)
+            run.reset_mock()
+            run.side_effect = [subprocess.CompletedProcess([], 1, '', 'Not Found (HTTP 404)'), subprocess.CompletedProcess([], 0, '', '')]
+            sync.keep_schedule_active()
+            self.assertEqual(run.call_count, 2)
+            payload = json.loads(run.call_args.kwargs['input'])
+            self.assertEqual(base64.b64decode(payload['content']).decode(), current_month)
+            self.assertNotIn('sha', payload)
 
 
 if __name__ == '__main__':
